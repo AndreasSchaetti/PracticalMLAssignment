@@ -1,0 +1,198 @@
+---
+author: "Andreas Schätti"
+date: "March 17, 2017"
+output: html_document
+---
+
+```{r libraries, echo=FALSE, warning=FALSE, message=FALSE}
+library(plyr)
+library(dplyr)
+library(MASS)
+library(caret)
+library(randomForest)
+library(rpart)
+library(tree)
+```
+
+## Analysis of Weight Lifting Data Set
+
+In this project we work on the [Weight Lifting Data Set](http://groupware.les.inf.puc-rio.br/har).
+This data set contains measurements from acceleration sensors that were fitted to different body parts of the participants (belt, arm, forearm, dumbbell).
+Our task is to predict how well the participants performed the biceps curl, a common weight lifting exercise.
+
+### Getting and cleaning the data
+
+Let's start by loading the data:
+
+```{r load data, cache=TRUE}
+df <- read.csv("../pml-training.csv", na.strings = c("NA", ""))
+dim(df)
+```
+
+This data set contains a lot of columns with summary statistics. These columns only contain data for a small fraction of the rows because they summarize the data in certain time windows (marked by the column *new_window*). We won't need them in this project. The row index (*X*), the user name and the time window data cannot be used for prediction and are removed as well.
+
+```{r clean data, warning=FALSE, cache=TRUE}
+df <- df %>%
+  filter(new_window == "no") %>%
+  dplyr::select(-contains("timestamp")) %>%
+  dplyr::select(-starts_with("kurtosis_")) %>%
+  dplyr::select(-starts_with("skewness_")) %>%
+  dplyr::select(-starts_with("max_")) %>%
+  dplyr::select(-starts_with("min_")) %>%
+  dplyr::select(-starts_with("amplitude_")) %>%
+  dplyr::select(-starts_with("avg_")) %>%
+  dplyr::select(-starts_with("var_")) %>%
+  dplyr::select(-starts_with("stddev_")) %>%
+  dplyr::select(-c(X, user_name, new_window, num_window))
+```
+
+### Splitting the data set
+
+We separate the data into three sets: training, testing and validation. Training and testing are combined into the building data set for single models. For the combined model, the combined predictor is set up using the training and testing data sets. The validation model is used for final model assessment as with the other models.
+
+10-fold cross-validation is used for hyperparameter optimization. Models without hyperparameters are trained without cross-validation.
+
+```{r create partition with validation set, cache=TRUE}
+inBuild <- createDataPartition(y = df$classe, p = 0.7, list = FALSE)
+building <- df[inBuild,]
+validation <- df[-inBuild,]
+
+inTrain <- createDataPartition(y = building$classe, p = 0.7, list = FALSE)
+training <- building[inTrain,]
+testing <- building[-inTrain,]
+```
+
+```{r sanity check, include=FALSE}
+stopifnot(all(table(training$classe) > 0))
+stopifnot(all(table(testing$classe) > 0))
+stopifnot(all(table(validation$classe) > 0))
+```
+
+### Classification performance measure
+
+There are six class labels with similar frequencies. This means that classification accuracy is a good way to compare the models: It is unlikely that an algorithm has good overall accuracy while performing significantly worse on some of the classes. Accuracy will be used throughout the project to assess out-of-sample error on the validation data set (accuracy in percent = 100% - out-of-sample error in percent).
+
+```{r table}
+table(training$classe)
+```
+
+### Model selection
+
+Classification with more than two class labels can be done with logistic regression. However, it is more common to use a Linear Discriminant Analysis (LDA) instead.
+
+We use the *caret* package throughout the project. For some models such as LDA cross validation is superfluous and we therefore disable it.
+
+```{r lda, cache=TRUE}
+lda.fit <- train(classe ~ ., data=building, method="lda",
+                 trcontrol=trainControl(method="none"))
+
+mean(predict(lda.fit, validation) == validation$classe)
+```
+
+We can do better than that! While LDA assumes a shared covariance matrix for all classes, Quadratic Discriminant Analysis (QDA) drops this assumption. This gives improved accuracy:
+
+```{r qda, cache=TRUE}
+qda.fit <- train(classe ~ ., data=building, method="qda",
+                 trcontrol=trainControl(method="none"))
+
+mean(predict(qda.fit, validation) == validation$classe)
+```
+
+Still not stellar. Maybe a decision tree can help to untangle the many features of this data set. Caret didn't do a good job optimizing the complexity parameter *cp*. Using the custom tune grid gives a better indication of the best value to choose. 
+
+While figuring out the tune grid I used the training and test data sets. Only for the final model assessment were the data sets changed to building and validation. 
+
+```{r decision tree rpart, cache=TRUE}
+set.seed(12345)
+rpart.fit <- train(classe ~ ., data=building, method="rpart",
+                   trControl=trainControl(method="cv"),
+                   tuneGrid=data.frame(cp=c(1e-6,5e-6,1e-5,5e-5,1e-4,5e-4,1e-3,1e-2)))
+plot(rpart.fit, scales = list(x = list(log = 10)))
+mean(predict(rpart.fit, validation) == validation$classe)
+```
+
+Accuracy does not improve even for very small values of *cp*. Since this parameter controls by how much each split has to decrease the lack of fit metric, it is not a good sign when we have to set it to such a tiny value to get a decent accuracy.
+
+Maybe all three models together perform better?
+
+```{r combine models, cache=TRUE}
+set.seed(12345)
+lda.fit.pred <- train(classe ~ ., data=training, method="lda",
+                 trcontrol=trainControl(method="none"))
+qda.fit.pred <- train(classe ~ ., data=training, method="qda",
+                 trcontrol=trainControl(method="none"))
+rpart.fit.pred <- train(classe ~ ., data=training, method="rpart",
+                   trControl=trainControl(method="cv"),
+                   tuneGrid=data.frame(cp=c(1e-6,5e-6,1e-5,5e-5,1e-4,5e-4,1e-3,1e-2)))
+                   
+lda.pred <- predict(lda.fit.pred, testing)
+qda.pred <- predict(qda.fit.pred, testing)
+rpart.pred <- predict(rpart.fit.pred, testing)
+
+df.pred <- data.frame(lda.pred,
+                      qda.pred,
+                      rpart.pred,
+                      classe=testing$classe)
+
+combined.fit <- train(classe ~ ., data=df.pred, method="rpart",
+                     trControl=trainControl(method="cv"),
+                     tuneGrid=data.frame(cp=seq(0, 0.01, 0.001)))
+ 
+lda.val.pred <- predict(lda.fit.pred, validation)
+qda.val.pred <- predict(qda.fit.pred, validation)
+rpart.val.pred <- predict(rpart.fit.pred, validation)
+df.val.pred <- data.frame(lda.pred=lda.val.pred,
+                          qda.pred=qda.val.pred,
+                          rpart.pred=rpart.val.pred,
+                          classe=validation$classe)
+
+mean(predict(combined.fit, df.val.pred) == df.val.pred$classe)
+```
+
+The combined model only gives a small improvement over the decision tree alone. One problem could be the correlations between the predictions of the LDA, QDA and decision tree models:
+
+```{r correlations}
+c(cor(as.numeric(lda.pred), as.numeric(qda.pred)),
+  cor(as.numeric(lda.pred), as.numeric(rpart.pred)),
+  cor(as.numeric(qda.pred), as.numeric(rpart.pred)))
+```
+
+As a last resort, let's try to combine many decision trees into a random forest.
+
+Caret does not optimize the number of trees. The higher this parameter the better. The only constraint is the computing power of your computer. In my case, I have to go for a relatively small number of trees.
+
+```{r random forest, cache=TRUE}
+set.seed(12345)
+rforest.fit <- train(classe ~ ., data=building, method="rf",
+                     trControl=trainControl(method="cv"),
+                     ntree=100)
+
+mean(predict(rforest.fit, validation) == validation$classe)
+```
+
+```{r oos error, echo=FALSE}
+accuracy <- 100 * mean(predict(rforest.fit, validation) == validation$classe)
+oos.error <- 100 - accuracy
+```
+
+This is what we've been craving for!
+
+### Analysis of random forest model
+
+The accuracy of the random forest model on the validation set is `r paste0(round(accuracy, 4), "%")`. This is equivalent to an out-of-sample error of `r paste0(round(oos.error, 4), "%")`.
+
+To celebrate, we also take a look at the confusion matrix and again marvel at the power of random forests. Only a tiny number of class labels were mispredicted!
+
+```{r confusion matrix}
+confusionMatrix(predict(rforest.fit, validation), validation$classe)$table
+```
+All jolly and swell, but which features were actually the most important in predicting the class labels, say the top 15?
+
+```{r variable importance}
+importance <- varImp(rforest.fit)$importance
+head(importance[order(-importance), , drop=FALSE], 15)
+```
+
+This indicates that the sensor fitted to the arm can be omitted without much loss of predictive power. This makes sense, since the arm does not move much during biceps curls compared to the forearm and the dumbbell.
+
+Random forests were clearly the winning model in this analysis. I expect that gradient-boosted trees will work at least as good, but the accuracy achieved with random forests is nonetheless impressive.
